@@ -167,14 +167,19 @@ function IngestionView({ onStart, initialText, initialFiles }: { onStart: (t: st
 }
 
 function ProcessingView({ text, files, onComplete, onCancel }: { text: string, files: File[], onComplete: (data: ReportData) => void, onCancel: () => void }) {
-  const [step, setStep] = useState(0);
+  const [statuses, setStatuses] = useState<Record<string, 'pending' | 'running' | 'completed'>>({
+    agent1: 'pending',
+    agent2: 'pending',
+    agent3: 'pending',
+    agent4: 'pending'
+  });
   const [error, setError] = useState<string | null>(null);
 
   const steps = [
-    "Agent 1: Performing OCR & Visual Analysis...",
-    "Agent 2: Parsing Medical Jargon...",
-    "Agent 3: Mapping Standard Health Ranges (via Search)...",
-    "Agent 4: Generating Actionable Insights..."
+    { id: 'agent1', label: "Agent 1: OCR & Visual Analysis" },
+    { id: 'agent2', label: "Agent 2: Parsing Medical Jargon" },
+    { id: 'agent3', label: "Agent 3: Mapping Health Ranges (Search)" },
+    { id: 'agent4', label: "Agent 4: Generating Insights" }
   ];
 
   useEffect(() => {
@@ -182,7 +187,7 @@ function ProcessingView({ text, files, onComplete, onCancel }: { text: string, f
     async function analyze() {
       try {
         // --- AGENT 1: OCR & Visual Analysis ---
-        setStep(0);
+        setStatuses(s => ({ ...s, agent1: 'running' }));
         const parts: any[] = [];
         if (text.trim()) parts.push({ text });
         for (const file of files) {
@@ -203,79 +208,95 @@ function ProcessingView({ text, files, onComplete, onCancel }: { text: string, f
         
         if (!isMounted) return;
         const extractedText = agent1Response.text || "No text extracted.";
+        setStatuses(s => ({ ...s, agent1: 'completed' }));
 
-        // --- AGENT 2: Parsing Medical Jargon ---
-        setStep(1);
-        const agent2Response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
-          contents: `Extract the vital metrics from this medical text:\n\n${extractedText}`,
-          config: {
-            systemInstruction: "You are a medical parser. Extract a list of vital metrics from the text. Return a JSON array.",
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING, description: "Name of the metric (e.g., LDL Cholesterol)" },
-                  value: { type: Type.STRING, description: "Value including units (e.g., 145 mg/dL)" }
-                },
-                required: ["name", "value"]
+        // --- PARALLEL EXECUTION: Agent 2/3 Pipeline AND Agent 4 ---
+        setStatuses(s => ({ ...s, agent2: 'running', agent4: 'running' }));
+
+        const metricsPipeline = async () => {
+          // --- AGENT 2: Parsing Medical Jargon ---
+          const agent2Response = await ai.models.generateContent({
+            model: 'gemini-3.1-flash-lite-preview',
+            contents: `Extract the vital metrics from this medical text:\n\n${extractedText}`,
+            config: {
+              systemInstruction: "You are a medical parser. Extract a list of vital metrics from the text. Return a JSON array.",
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    name: { type: Type.STRING, description: "Name of the metric (e.g., LDL Cholesterol)" },
+                    value: { type: Type.STRING, description: "Value including units (e.g., 145 mg/dL)" }
+                  },
+                  required: ["name", "value"]
+                }
               }
             }
+          });
+
+          if (!isMounted) return [];
+          const parsedMetrics = JSON.parse(agent2Response.text || "[]");
+          
+          if (parsedMetrics.length === 0) {
+             throw new Error("No medical metrics found in the provided data.");
           }
-        });
+          setStatuses(s => ({ ...s, agent2: 'completed', agent3: 'running' }));
 
-        if (!isMounted) return;
-        const parsedMetrics = JSON.parse(agent2Response.text || "[]");
-        
-        if (parsedMetrics.length === 0) {
-           throw new Error("No medical metrics found in the provided data.");
-        }
-
-        // --- AGENT 3: Mapping Standard Health Ranges (with Google Search) ---
-        setStep(2);
-        const agent3Response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
-          contents: `Here are the patient's metrics: ${JSON.stringify(parsedMetrics)}. Use Google Search to find the standard healthy ranges for these specific metrics. Then, map each metric to its standard range and determine if it is 'normal' or 'flagged'. Return ONLY a raw JSON array of objects with keys: name, value, range, status.`,
-          config: {
-            tools: [{ googleSearch: {} }],
-            systemInstruction: "You are a medical reference agent. Use search to find standard ranges. Return ONLY a valid JSON array of the metrics with 'range' and 'status' added. Do not include markdown formatting like ```json.",
-          }
-        });
-
-        if (!isMounted) return;
-        let mappedMetrics = [];
-        try {
-          // Clean up potential markdown formatting if the model still includes it
-          const rawText = (agent3Response.text || "[]").replace(/```json/g, '').replace(/```/g, '').trim();
-          mappedMetrics = JSON.parse(rawText);
-        } catch (e) {
-          console.warn("Failed to parse Agent 3 JSON, falling back to original metrics", e);
-          mappedMetrics = parsedMetrics.map((m: any) => ({ ...m, range: "Unknown", status: "normal" }));
-        }
-
-        // --- AGENT 4: Generating Actionable Insights ---
-        setStep(3);
-        const agent4Response = await ai.models.generateContent({
-          model: 'gemini-3.1-flash-lite-preview',
-          contents: `Patient metrics: ${JSON.stringify(mappedMetrics)}. Generate a plain English executive summary of these results.`,
-          config: {
-            systemInstruction: "You are a patient advocate agent. Write a clear, empathetic, plain English summary of the patient's health metrics. Highlight any flagged metrics and explain what they mean in simple terms.",
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                summary: { type: Type.STRING }
-              },
-              required: ["summary"]
+          // --- AGENT 3: Mapping Standard Health Ranges (with Google Search) ---
+          const agent3Response = await ai.models.generateContent({
+            model: 'gemini-3.1-flash-lite-preview',
+            contents: `Here are the patient's metrics: ${JSON.stringify(parsedMetrics)}. Use Google Search to find the standard healthy ranges for these specific metrics. Then, map each metric to its standard range and determine if it is 'normal' or 'flagged'. Return ONLY a raw JSON array of objects with keys: name, value, range, status.`,
+            config: {
+              tools: [{ googleSearch: {} }],
+              systemInstruction: "You are a medical reference agent. Use search to find standard ranges. Return ONLY a valid JSON array of the metrics with 'range' and 'status' added. Do not include markdown formatting like ```json.",
             }
+          });
+
+          if (!isMounted) return [];
+          let mappedMetrics = [];
+          try {
+            // Clean up potential markdown formatting if the model still includes it
+            const rawText = (agent3Response.text || "[]").replace(/```json/g, '').replace(/```/g, '').trim();
+            mappedMetrics = JSON.parse(rawText);
+          } catch (e) {
+            console.warn("Failed to parse Agent 3 JSON, falling back to original metrics", e);
+            mappedMetrics = parsedMetrics.map((m: any) => ({ ...m, range: "Unknown", status: "normal" }));
           }
-        });
+          setStatuses(s => ({ ...s, agent3: 'completed' }));
+          return mappedMetrics;
+        };
+
+        const summaryPipeline = async () => {
+          // --- AGENT 4: Generating Actionable Insights ---
+          const agent4Response = await ai.models.generateContent({
+            model: 'gemini-3.1-flash-lite-preview',
+            contents: `Patient medical text:\n\n${extractedText}\n\nGenerate a plain English executive summary of these results.`,
+            config: {
+              systemInstruction: "You are a patient advocate agent. Write a clear, empathetic, plain English summary of the patient's health metrics based on the provided text. Highlight any obvious flagged metrics and explain what they mean in simple terms.",
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  summary: { type: Type.STRING }
+                },
+                required: ["summary"]
+              }
+            }
+          });
+
+          if (!isMounted) return "Summary generation failed.";
+          const finalSummary = JSON.parse(agent4Response.text || "{}").summary || "Summary generation failed.";
+          setStatuses(s => ({ ...s, agent4: 'completed' }));
+          return finalSummary;
+        };
+
+        const [mappedMetrics, finalSummary] = await Promise.all([
+          metricsPipeline(),
+          summaryPipeline()
+        ]);
 
         if (!isMounted) return;
-        const finalSummary = JSON.parse(agent4Response.text || "{}").summary || "Summary generation failed.";
-
         onComplete({ summary: finalSummary, metrics: mappedMetrics });
 
       } catch (err: any) {
@@ -305,17 +326,24 @@ function ProcessingView({ text, files, onComplete, onCancel }: { text: string, f
       ) : (
         <>
           <Activity className="w-24 h-24 animate-pulse mb-16" strokeWidth={1.5} />
-          <div className="w-full max-w-2xl space-y-6">
-            {steps.map((s, i) => (
-              <div 
-                key={i} 
-                className={`p-6 border-4 border-black font-mono text-lg md:text-xl font-bold transition-all duration-300 rounded-none ${
-                  i <= step ? 'bg-black text-white opacity-100 translate-x-0' : 'bg-white text-gray-300 border-gray-200 opacity-50 -translate-x-8'
-                }`}
-              >
-                {s}
-              </div>
-            ))}
+          <div className="w-full max-w-2xl space-y-4">
+            {steps.map((s) => {
+              const status = statuses[s.id as keyof typeof statuses];
+              return (
+                <div 
+                  key={s.id} 
+                  className={`p-6 border-4 font-mono text-lg md:text-xl font-bold transition-all duration-300 rounded-none flex items-center justify-between ${
+                    status === 'completed' ? 'bg-black text-white border-black opacity-100 translate-x-0' : 
+                    status === 'running' ? 'bg-white text-black border-black opacity-100 translate-x-0 animate-pulse' : 
+                    'bg-white text-gray-300 border-gray-200 opacity-50 -translate-x-4'
+                  }`}
+                >
+                  <span>{s.label}</span>
+                  {status === 'completed' && <CheckCircle className="w-6 h-6" />}
+                  {status === 'running' && <RefreshCw className="w-6 h-6 animate-spin" />}
+                </div>
+              );
+            })}
           </div>
         </>
       )}
